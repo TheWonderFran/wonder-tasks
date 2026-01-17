@@ -40,11 +40,9 @@ export async function getOrCreateOrganization(
     return null
   }
 
-  // Create default statuses for the new organization
-  await createDefaultStatuses(supabase, newOrg.id)
-
-  // Update user with organization
-  await supabase
+  // IMPORTANT: Insert user FIRST so they have permission to create statuses
+  // The RLS policy for statuses requires the user to be linked to the organization
+  const { error: userError } = await supabase
     .from('users')
     .upsert({
       id: userId,
@@ -52,6 +50,14 @@ export async function getOrCreateOrganization(
       organization_id: newOrg.id,
       role: 'owner'
     })
+
+  if (userError) {
+    console.error('Error creating user:', userError)
+    return null
+  }
+
+  // Now create default statuses (user has permission via RLS)
+  await createDefaultStatuses(supabase, newOrg.id)
 
   return newOrg as Organization
 }
@@ -74,9 +80,13 @@ export async function createDefaultStatuses(
     { name: 'Blocked', slug: 'blocked', icon: 'ban', group: 'specific', is_default: false, in_task_limit: false, position: 6 },
   ]
 
-  await supabase
+  const { error } = await supabase
     .from('statuses')
     .insert(defaultStatuses.map(s => ({ ...s, organization_id: organizationId })))
+
+  if (error) {
+    console.error('Error creating default statuses:', error)
+  }
 }
 
 export async function getStatuses(

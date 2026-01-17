@@ -146,10 +146,33 @@ export default function DashboardClient({ user }: DashboardClientProps) {
 
   // Handlers
   const handleCreateTask = async () => {
-    if (!newTaskTitle.trim() || !organization) return
+    console.log('handleCreateTask called', { newTaskTitle, organization, statuses })
     
-    const defaultStatus = statuses.find(s => s.is_default && s.group === 'beginning') || statuses[0]
-    if (!defaultStatus) return
+    if (!newTaskTitle.trim()) {
+      console.error('Task title is empty')
+      return
+    }
+    
+    if (!organization) {
+      console.error('Organization is null')
+      return
+    }
+    
+    // Find default status - try multiple approaches
+    let defaultStatus = statuses.find(s => s.is_default && s.group === 'beginning')
+    if (!defaultStatus) {
+      defaultStatus = statuses.find(s => s.group === 'beginning')
+    }
+    if (!defaultStatus) {
+      defaultStatus = statuses[0]
+    }
+    
+    if (!defaultStatus) {
+      console.error('No statuses available', statuses)
+      return
+    }
+    
+    console.log('Creating task with status:', defaultStatus)
     
     const newTask = await createTask(supabase, {
       organization_id: organization.id,
@@ -162,6 +185,8 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       created_by: user.id
     })
     
+    console.log('createTask result:', newTask)
+    
     if (newTask) {
       setTasks(prev => [newTask, ...prev])
       setNewTaskTitle('')
@@ -170,6 +195,8 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       setNewTaskPriority('medium')
       setNewTaskType('client')
       setShowNewTaskModal(false)
+    } else {
+      console.error('Failed to create task - newTask is null')
     }
   }
 
