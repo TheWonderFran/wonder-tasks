@@ -9,7 +9,7 @@ import {
   Eye, EyeOff, MoreHorizontal, CheckCircle2, Circle, Clock,
   AlertCircle, Users, Briefcase, Settings, LayoutGrid, List, Archive,
   ChevronRight, FolderOpen, Home, FileText, MessageCircle, Loader,
-  HelpCircle, ExternalLink, Ban, LogOut
+  HelpCircle, ExternalLink, Ban, LogOut, LucideIcon
 } from 'lucide-react'
 import type { Task, Client, Status, Plan, Organization, User as AppUser } from '@/lib/types'
 import {
@@ -20,7 +20,7 @@ import {
 } from '@/lib/supabase/queries'
 
 // Icon mapping for statuses
-const statusIcons: Record<string, React.ComponentType<{ size?: number; className?: string }>> = {
+const statusIcons: Record<string, LucideIcon> = {
   'circle': Circle,
   'clock': Clock,
   'loader': Loader,
