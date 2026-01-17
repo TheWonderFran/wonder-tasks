@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import type { User } from '@supabase/supabase-js'
@@ -8,10 +8,10 @@ import {
   Search, Filter, Plus, Paperclip, MessageSquare, Calendar, X, User as UserIcon,
   Eye, EyeOff, MoreHorizontal, CheckCircle2, Circle, Clock,
   AlertCircle, Users, Briefcase, Settings, LayoutGrid, List, Archive,
-  ChevronRight, FolderOpen, Home, FileText, MessageCircle, Loader,
-  HelpCircle, ExternalLink, Ban, LogOut, LucideIcon
+  ChevronRight, ChevronDown, FolderOpen, Home, FileText, MessageCircle, Loader,
+  HelpCircle, ExternalLink, Ban, LogOut, LucideIcon, Send, Upload, Trash2
 } from 'lucide-react'
-import type { Task, Client, Status, Plan, Organization, User as AppUser } from '@/lib/types'
+import type { Task, Client, Status, Plan, Organization, User as AppUser, Comment, Attachment } from '@/lib/types'
 import {
   getTasks, createTask, updateTask, deleteTask,
   getClients, createClient as createClientApi,
@@ -58,6 +58,23 @@ export default function DashboardClient({ user }: DashboardClientProps) {
   const [selectedTask, setSelectedTask] = useState<Task | null>(null)
   const [showNewTaskModal, setShowNewTaskModal] = useState(false)
   const [showNewClientModal, setShowNewClientModal] = useState(false)
+  const [expandedPlans, setExpandedPlans] = useState<Record<string, boolean>>({})
+  const [expandedStatuses, setExpandedStatuses] = useState<Record<string, boolean>>({})
+  
+  // Drag and drop state
+  const [draggedTask, setDraggedTask] = useState<Task | null>(null)
+  const [dragOverStatus, setDragOverStatus] = useState<string | null>(null)
+  
+  // Comments state
+  const [comments, setComments] = useState<Comment[]>([])
+  const [newComment, setNewComment] = useState('')
+  const [isInternalComment, setIsInternalComment] = useState(false)
+  const [loadingComments, setLoadingComments] = useState(false)
+  
+  // Attachments state
+  const [attachments, setAttachments] = useState<Attachment[]>([])
+  const [uploadingFile, setUploadingFile] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   
   // New task form state
   const [newTaskTitle, setNewTaskTitle] = useState('')
@@ -75,7 +92,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     async function loadData() {
       setLoading(true)
       
-      // Get or create organization for this user
       const org = await getOrCreateOrganization(supabase, user.id, user.email || '')
       if (!org) {
         console.error('Failed to get/create organization')
@@ -84,7 +100,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       }
       setOrganization(org)
       
-      // Load all data in parallel
       const [tasksData, clientsData, statusesData, plansData, teamData] = await Promise.all([
         getTasks(supabase, org.id),
         getClients(supabase, org.id),
@@ -98,7 +113,17 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       setStatuses(statusesData)
       setTeamMembers(teamData)
       
-      // Create default plans if none exist
+      // Initialize expanded plans
+      const planExpansion: Record<string, boolean> = {}
+      plansData.forEach(plan => { planExpansion[plan.id] = true })
+      planExpansion['no-plan'] = true
+      setExpandedPlans(planExpansion)
+      
+      // Initialize expanded statuses for list view
+      const statusExpansion: Record<string, boolean> = {}
+      statusesData.forEach(status => { statusExpansion[status.id] = true })
+      setExpandedStatuses(statusExpansion)
+      
       if (plansData.length === 0) {
         await createDefaultPlans(supabase, org.id)
         const newPlans = await getPlans(supabase, org.id)
@@ -113,18 +138,54 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     loadData()
   }, [user.id, user.email])
 
-  // Filter tasks based on search, client selection, and type filter
+  // Load comments and attachments when task is selected
+  useEffect(() => {
+    async function loadTaskDetails() {
+      if (!selectedTask) {
+        setComments([])
+        setAttachments([])
+        return
+      }
+      
+      setLoadingComments(true)
+      
+      // Load comments
+      const { data: commentsData } = await supabase
+        .from('comments')
+        .select('*, author:users(*)')
+        .eq('task_id', selectedTask.id)
+        .order('created_at', { ascending: true })
+      
+      if (commentsData) {
+        setComments(commentsData as Comment[])
+      }
+      
+      // Load attachments
+      const { data: attachmentsData } = await supabase
+        .from('attachments')
+        .select('*')
+        .eq('task_id', selectedTask.id)
+        .order('created_at', { ascending: false })
+      
+      if (attachmentsData) {
+        setAttachments(attachmentsData as Attachment[])
+      }
+      
+      setLoadingComments(false)
+    }
+    
+    loadTaskDetails()
+  }, [selectedTask?.id])
+
+  // Filter tasks
   const filteredTasks = useMemo(() => {
     return tasks.filter(task => {
-      // Search filter
       if (searchQuery && !task.title.toLowerCase().includes(searchQuery.toLowerCase())) {
         return false
       }
-      // Client filter
       if (selectedClient && task.client_id !== selectedClient) {
         return false
       }
-      // Type filter
       if (taskFilter === 'client' && task.type !== 'client') {
         return false
       }
@@ -135,7 +196,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     })
   }, [tasks, searchQuery, selectedClient, taskFilter])
 
-  // Group tasks by status for kanban view
+  // Group tasks by status
   const tasksByStatus = useMemo(() => {
     const grouped: Record<string, Task[]> = {}
     statuses.forEach(status => {
@@ -144,35 +205,72 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     return grouped
   }, [filteredTasks, statuses])
 
-  // Handlers
+  // Group clients by plan
+  const clientsByPlan = useMemo(() => {
+    const grouped: Record<string, Client[]> = {}
+    
+    // Initialize with plan IDs
+    plans.forEach(plan => {
+      grouped[plan.id] = []
+    })
+    grouped['no-plan'] = []
+    
+    // Group clients
+    clients.forEach(client => {
+      if (client.plan_id && grouped[client.plan_id]) {
+        grouped[client.plan_id].push(client)
+      } else {
+        grouped['no-plan'].push(client)
+      }
+    })
+    
+    return grouped
+  }, [clients, plans])
+
+  // Drag and drop handlers
+  const handleDragStart = (e: React.DragEvent, task: Task) => {
+    setDraggedTask(task)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  const handleDragOver = (e: React.DragEvent, statusId: string) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    setDragOverStatus(statusId)
+  }
+
+  const handleDragLeave = () => {
+    setDragOverStatus(null)
+  }
+
+  const handleDrop = async (e: React.DragEvent, statusId: string) => {
+    e.preventDefault()
+    setDragOverStatus(null)
+    
+    if (draggedTask && draggedTask.status_id !== statusId) {
+      const updated = await updateTask(supabase, draggedTask.id, { status_id: statusId })
+      if (updated) {
+        setTasks(prev => prev.map(t => t.id === draggedTask.id ? updated : t))
+      }
+    }
+    
+    setDraggedTask(null)
+  }
+
+  const handleDragEnd = () => {
+    setDraggedTask(null)
+    setDragOverStatus(null)
+  }
+
+  // Task handlers
   const handleCreateTask = async () => {
-    console.log('handleCreateTask called', { newTaskTitle, organization, statuses })
+    if (!newTaskTitle.trim() || !organization) return
     
-    if (!newTaskTitle.trim()) {
-      console.error('Task title is empty')
-      return
-    }
-    
-    if (!organization) {
-      console.error('Organization is null')
-      return
-    }
-    
-    // Find default status - try multiple approaches
     let defaultStatus = statuses.find(s => s.is_default && s.group === 'beginning')
-    if (!defaultStatus) {
-      defaultStatus = statuses.find(s => s.group === 'beginning')
-    }
-    if (!defaultStatus) {
-      defaultStatus = statuses[0]
-    }
+    if (!defaultStatus) defaultStatus = statuses.find(s => s.group === 'beginning')
+    if (!defaultStatus) defaultStatus = statuses[0]
     
-    if (!defaultStatus) {
-      console.error('No statuses available', statuses)
-      return
-    }
-    
-    console.log('Creating task with status:', defaultStatus)
+    if (!defaultStatus) return
     
     const newTask = await createTask(supabase, {
       organization_id: organization.id,
@@ -185,8 +283,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       created_by: user.id
     })
     
-    console.log('createTask result:', newTask)
-    
     if (newTask) {
       setTasks(prev => [newTask, ...prev])
       setNewTaskTitle('')
@@ -195,8 +291,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       setNewTaskPriority('medium')
       setNewTaskType('client')
       setShowNewTaskModal(false)
-    } else {
-      console.error('Failed to create task - newTask is null')
     }
   }
 
@@ -204,6 +298,9 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     const updated = await updateTask(supabase, taskId, { status_id: newStatusId })
     if (updated) {
       setTasks(prev => prev.map(t => t.id === taskId ? updated : t))
+      if (selectedTask?.id === taskId) {
+        setSelectedTask(updated)
+      }
     }
   }
 
@@ -215,6 +312,71 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     }
   }
 
+  // Comment handlers
+  const handleAddComment = async () => {
+    if (!newComment.trim() || !selectedTask) return
+    
+    const { data, error } = await supabase
+      .from('comments')
+      .insert({
+        task_id: selectedTask.id,
+        author_id: user.id,
+        content: newComment,
+        is_internal: isInternalComment
+      })
+      .select('*, author:users(*)')
+      .single()
+    
+    if (data && !error) {
+      setComments(prev => [...prev, data as Comment])
+      setNewComment('')
+    }
+  }
+
+  // File upload handler
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file || !selectedTask || !organization) return
+    
+    setUploadingFile(true)
+    
+    const fileExt = file.name.split('.').pop()
+    const filePath = `${organization.id}/${selectedTask.id}/${Date.now()}.${fileExt}`
+    
+    const { error: uploadError } = await supabase.storage
+      .from('attachments')
+      .upload(filePath, file)
+    
+    if (uploadError) {
+      console.error('Upload error:', uploadError)
+      setUploadingFile(false)
+      return
+    }
+    
+    const { data: attachment, error: dbError } = await supabase
+      .from('attachments')
+      .insert({
+        task_id: selectedTask.id,
+        uploaded_by: user.id,
+        file_name: file.name,
+        file_size: file.size,
+        file_type: file.type,
+        storage_path: filePath
+      })
+      .select()
+      .single()
+    
+    if (attachment && !dbError) {
+      setAttachments(prev => [attachment as Attachment, ...prev])
+    }
+    
+    setUploadingFile(false)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
+  }
+
+  // Client handlers
   const handleCreateClient = async () => {
     if (!newClientName.trim() || !organization) return
     
@@ -237,10 +399,24 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     router.push('/auth/login')
   }
 
-  // Render status icon
+  const togglePlanExpansion = (planId: string) => {
+    setExpandedPlans(prev => ({ ...prev, [planId]: !prev[planId] }))
+  }
+
+  const toggleStatusExpansion = (statusId: string) => {
+    setExpandedStatuses(prev => ({ ...prev, [statusId]: !prev[statusId] }))
+  }
+
   const renderStatusIcon = (iconName: string, className?: string) => {
     const IconComponent = statusIcons[iconName] || Circle
     return <IconComponent size={16} className={className} />
+  }
+
+  const formatFileSize = (bytes?: number) => {
+    if (!bytes) return ''
+    if (bytes < 1024) return bytes + ' B'
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
   }
 
   if (loading) {
@@ -283,7 +459,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
             </button>
           </div>
           
-          {/* Clients Section */}
+          {/* Clients Section - Grouped by Plan */}
           <div className="mt-6">
             <div className="flex items-center justify-between px-3 mb-2">
               <span className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Clients</span>
@@ -294,28 +470,89 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                 <Plus size={14} />
               </button>
             </div>
-            <div className="space-y-1">
-              {clients.map(client => (
+            
+            {/* Plans as folders */}
+            {plans.map(plan => {
+              const planClients = clientsByPlan[plan.id] || []
+              if (planClients.length === 0) return null
+              
+              return (
+                <div key={plan.id} className="mb-2">
+                  <button
+                    onClick={() => togglePlanExpansion(plan.id)}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-zinc-400 hover:text-white transition-colors"
+                  >
+                    {expandedPlans[plan.id] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    <FolderOpen size={14} />
+                    <span className="text-xs font-medium">{plan.name}</span>
+                    <span className="ml-auto text-xs text-zinc-600">{planClients.length}</span>
+                  </button>
+                  
+                  {expandedPlans[plan.id] && (
+                    <div className="ml-4 space-y-1">
+                      {planClients.map(client => (
+                        <button
+                          key={client.id}
+                          onClick={() => setSelectedClient(client.id)}
+                          className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-all ${
+                            selectedClient === client.id ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
+                          }`}
+                        >
+                          <div className="w-5 h-5 rounded bg-zinc-700 flex items-center justify-center text-xs font-medium text-white">
+                            {client.name.charAt(0)}
+                          </div>
+                          <span className="text-sm truncate">{client.name}</span>
+                          <span className="ml-auto text-xs text-zinc-500">
+                            {tasks.filter(t => t.client_id === client.id).length}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            
+            {/* Clients without plan */}
+            {clientsByPlan['no-plan']?.length > 0 && (
+              <div className="mb-2">
                 <button
-                  key={client.id}
-                  onClick={() => setSelectedClient(client.id)}
-                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all ${
-                    selectedClient === client.id ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
-                  }`}
+                  onClick={() => togglePlanExpansion('no-plan')}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-zinc-400 hover:text-white transition-colors"
                 >
-                  <div className="w-6 h-6 rounded bg-zinc-700 flex items-center justify-center text-xs font-medium text-white">
-                    {client.name.charAt(0)}
-                  </div>
-                  <span className="text-sm truncate">{client.name}</span>
-                  <span className="ml-auto text-xs text-zinc-500">
-                    {tasks.filter(t => t.client_id === client.id).length}
-                  </span>
+                  {expandedPlans['no-plan'] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  <FolderOpen size={14} />
+                  <span className="text-xs font-medium">No Plan</span>
+                  <span className="ml-auto text-xs text-zinc-600">{clientsByPlan['no-plan'].length}</span>
                 </button>
-              ))}
-              {clients.length === 0 && (
-                <p className="px-3 py-2 text-xs text-zinc-600">No clients yet</p>
-              )}
-            </div>
+                
+                {expandedPlans['no-plan'] && (
+                  <div className="ml-4 space-y-1">
+                    {clientsByPlan['no-plan'].map(client => (
+                      <button
+                        key={client.id}
+                        onClick={() => setSelectedClient(client.id)}
+                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-all ${
+                          selectedClient === client.id ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
+                        }`}
+                      >
+                        <div className="w-5 h-5 rounded bg-zinc-700 flex items-center justify-center text-xs font-medium text-white">
+                          {client.name.charAt(0)}
+                        </div>
+                        <span className="text-sm truncate">{client.name}</span>
+                        <span className="ml-auto text-xs text-zinc-500">
+                          {tasks.filter(t => t.client_id === client.id).length}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            
+            {clients.length === 0 && (
+              <p className="px-3 py-2 text-xs text-zinc-600">No clients yet</p>
+            )}
           </div>
         </nav>
         
@@ -385,7 +622,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
           </div>
           
           <div className="flex items-center gap-3">
-            {/* Search */}
             <div className="relative">
               <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
               <input
@@ -397,7 +633,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
               />
             </div>
             
-            {/* View Toggle */}
             <div className="flex items-center gap-1 bg-zinc-900 rounded-lg p-1">
               <button
                 onClick={() => setViewMode('kanban')}
@@ -417,7 +652,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
               </button>
             </div>
             
-            {/* New Task Button */}
             <button
               onClick={() => setShowNewTaskModal(true)}
               className="flex items-center gap-2 px-4 py-2 bg-teal-500 hover:bg-teal-600 text-white rounded-lg text-sm font-medium transition-colors"
@@ -431,10 +665,18 @@ export default function DashboardClient({ user }: DashboardClientProps) {
         {/* Content */}
         <div className="flex-1 overflow-auto p-6">
           {viewMode === 'kanban' ? (
-            /* Kanban View */
+            /* Kanban View with Drag & Drop */
             <div className="flex gap-4 h-full">
               {statuses.map(status => (
-                <div key={status.id} className="flex-shrink-0 w-72 flex flex-col">
+                <div 
+                  key={status.id} 
+                  className={`flex-shrink-0 w-72 flex flex-col rounded-xl transition-colors ${
+                    dragOverStatus === status.id ? 'bg-zinc-900/50' : ''
+                  }`}
+                  onDragOver={(e) => handleDragOver(e, status.id)}
+                  onDragLeave={handleDragLeave}
+                  onDrop={(e) => handleDrop(e, status.id)}
+                >
                   <div className="flex items-center gap-2 mb-3 px-2">
                     {renderStatusIcon(status.icon, 'text-zinc-500')}
                     <span className="text-sm font-medium text-zinc-300">{status.name}</span>
@@ -442,12 +684,19 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                       {tasksByStatus[status.id]?.length || 0}
                     </span>
                   </div>
-                  <div className="flex-1 space-y-2 overflow-auto">
+                  <div className={`flex-1 space-y-2 overflow-auto min-h-[200px] rounded-lg p-1 ${
+                    dragOverStatus === status.id ? 'ring-2 ring-teal-500/50 ring-dashed' : ''
+                  }`}>
                     {tasksByStatus[status.id]?.map(task => (
                       <div
                         key={task.id}
+                        draggable
+                        onDragStart={(e) => handleDragStart(e, task)}
+                        onDragEnd={handleDragEnd}
                         onClick={() => setSelectedTask(task)}
-                        className="p-4 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-700 cursor-pointer transition-colors"
+                        className={`p-4 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-700 cursor-pointer transition-all ${
+                          draggedTask?.id === task.id ? 'opacity-50 scale-95' : ''
+                        }`}
                       >
                         <div className="flex items-start justify-between mb-2">
                           <h3 className="text-sm font-medium text-white line-clamp-2">{task.title}</h3>
@@ -468,11 +717,25 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                               <span className="text-xs text-zinc-500">{task.client.name}</span>
                             )}
                           </div>
-                          <span className={`text-xs px-2 py-0.5 rounded ${
-                            task.type === 'internal' ? 'bg-purple-950 text-purple-400' : 'bg-blue-950 text-blue-400'
-                          }`}>
-                            {task.type}
-                          </span>
+                          <div className="flex items-center gap-2">
+                            {(task.comments?.length || 0) > 0 && (
+                              <span className="flex items-center gap-1 text-xs text-zinc-500">
+                                <MessageSquare size={12} />
+                                {task.comments?.length}
+                              </span>
+                            )}
+                            {(task.attachments?.length || 0) > 0 && (
+                              <span className="flex items-center gap-1 text-xs text-zinc-500">
+                                <Paperclip size={12} />
+                                {task.attachments?.length}
+                              </span>
+                            )}
+                            <span className={`text-xs px-2 py-0.5 rounded ${
+                              task.type === 'internal' ? 'bg-purple-950 text-purple-400' : 'bg-blue-950 text-blue-400'
+                            }`}>
+                              {task.type}
+                            </span>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -486,36 +749,66 @@ export default function DashboardClient({ user }: DashboardClientProps) {
               ))}
             </div>
           ) : (
-            /* List View */
-            <div className="space-y-2">
-              {filteredTasks.map(task => (
-                <div
-                  key={task.id}
-                  onClick={() => setSelectedTask(task)}
-                  className="flex items-center gap-4 p-4 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-700 cursor-pointer transition-colors"
-                >
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-sm font-medium text-white truncate">{task.title}</h3>
-                    {task.description && (
-                      <p className="text-xs text-zinc-500 truncate">{task.description}</p>
+            /* List View - Grouped by Status */
+            <div className="space-y-4">
+              {statuses.map(status => {
+                const statusTasks = tasksByStatus[status.id] || []
+                
+                return (
+                  <div key={status.id} className="bg-zinc-900/50 rounded-xl overflow-hidden">
+                    <button
+                      onClick={() => toggleStatusExpansion(status.id)}
+                      className="w-full flex items-center gap-3 px-4 py-3 hover:bg-zinc-900 transition-colors"
+                    >
+                      {expandedStatuses[status.id] ? <ChevronDown size={16} className="text-zinc-500" /> : <ChevronRight size={16} className="text-zinc-500" />}
+                      {renderStatusIcon(status.icon, 'text-zinc-500')}
+                      <span className="text-sm font-medium text-zinc-300">{status.name}</span>
+                      <span className="text-xs text-zinc-600 bg-zinc-800 px-2 py-0.5 rounded-full">
+                        {statusTasks.length}
+                      </span>
+                    </button>
+                    
+                    {expandedStatuses[status.id] && statusTasks.length > 0 && (
+                      <div className="border-t border-zinc-800">
+                        {statusTasks.map((task, index) => (
+                          <div
+                            key={task.id}
+                            onClick={() => setSelectedTask(task)}
+                            className={`flex items-center gap-4 px-4 py-3 hover:bg-zinc-900 cursor-pointer transition-colors ${
+                              index !== statusTasks.length - 1 ? 'border-b border-zinc-800/50' : ''
+                            }`}
+                          >
+                            <div className="flex-1 min-w-0">
+                              <h3 className="text-sm font-medium text-white truncate">{task.title}</h3>
+                            </div>
+                            {task.client && (
+                              <span className="text-xs text-zinc-500 px-2 py-1 bg-zinc-800 rounded">
+                                {task.client.name}
+                              </span>
+                            )}
+                            <div className="flex items-center gap-2">
+                              {(task.comments?.length || 0) > 0 && (
+                                <span className="flex items-center gap-1 text-xs text-zinc-500">
+                                  <MessageSquare size={12} />
+                                  {task.comments?.length}
+                                </span>
+                              )}
+                            </div>
+                            <span className={`px-2 py-0.5 text-xs rounded-full ${
+                              task.priority === 'high' ? 'bg-red-950 text-red-400' :
+                              task.priority === 'medium' ? 'bg-yellow-950 text-yellow-400' :
+                              'bg-zinc-800 text-zinc-400'
+                            }`}>
+                              {task.priority}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
                     )}
                   </div>
-                  {task.client && (
-                    <span className="text-xs text-zinc-500">{task.client.name}</span>
-                  )}
-                  <div className="flex items-center gap-2">
-                    {renderStatusIcon(task.status?.icon || 'circle', 'text-zinc-500')}
-                    <span className="text-xs text-zinc-400">{task.status?.name}</span>
-                  </div>
-                  <span className={`px-2 py-0.5 text-xs rounded-full ${
-                    task.priority === 'high' ? 'bg-red-950 text-red-400' :
-                    task.priority === 'medium' ? 'bg-yellow-950 text-yellow-400' :
-                    'bg-zinc-800 text-zinc-400'
-                  }`}>
-                    {task.priority}
-                  </span>
-                </div>
-              ))}
+                )
+              })}
+              
               {filteredTasks.length === 0 && (
                 <div className="text-center py-12">
                   <p className="text-zinc-500">No tasks found</p>
@@ -544,86 +837,202 @@ export default function DashboardClient({ user }: DashboardClientProps) {
               <X size={16} />
             </button>
           </div>
-          <div className="flex-1 overflow-auto p-4 space-y-6">
-            <div>
-              <h3 className="text-lg font-medium text-white mb-2">{selectedTask.title}</h3>
-              {selectedTask.description && (
-                <p className="text-sm text-zinc-400">{selectedTask.description}</p>
+          
+          <div className="flex-1 overflow-auto">
+            {/* Task Info */}
+            <div className="p-4 space-y-4 border-b border-zinc-800">
+              <div>
+                <h3 className="text-lg font-medium text-white mb-2">{selectedTask.title}</h3>
+                {selectedTask.description && (
+                  <p className="text-sm text-zinc-400">{selectedTask.description}</p>
+                )}
+              </div>
+              
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs text-zinc-500 block mb-2">Status</label>
+                  <select
+                    value={selectedTask.status_id || ''}
+                    onChange={(e) => handleUpdateTaskStatus(selectedTask.id, e.target.value)}
+                    className="w-full px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white focus:outline-none focus:border-zinc-700"
+                  >
+                    {statuses.map(status => (
+                      <option key={status.id} value={status.id}>{status.name}</option>
+                    ))}
+                  </select>
+                </div>
+                
+                <div>
+                  <label className="text-xs text-zinc-500 block mb-2">Priority</label>
+                  <div className="flex gap-2">
+                    {(['low', 'medium', 'high'] as const).map(priority => (
+                      <button
+                        key={priority}
+                        onClick={async () => {
+                          const updated = await updateTask(supabase, selectedTask.id, { priority })
+                          if (updated) {
+                            setTasks(prev => prev.map(t => t.id === selectedTask.id ? updated : t))
+                            setSelectedTask(updated)
+                          }
+                        }}
+                        className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors ${
+                          selectedTask.priority === priority
+                            ? priority === 'high' ? 'bg-red-950 text-red-400 border border-red-900' :
+                              priority === 'medium' ? 'bg-yellow-950 text-yellow-400 border border-yellow-900' :
+                              'bg-zinc-800 text-zinc-300 border border-zinc-700'
+                            : 'bg-zinc-900 text-zinc-500 border border-zinc-800 hover:border-zinc-700'
+                        }`}
+                      >
+                        {priority.charAt(0).toUpperCase() + priority.slice(1)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                
+                <div>
+                  <label className="text-xs text-zinc-500 block mb-2">Type</label>
+                  <div className="flex gap-2">
+                    {(['client', 'internal'] as const).map(type => (
+                      <button
+                        key={type}
+                        onClick={async () => {
+                          const updated = await updateTask(supabase, selectedTask.id, { type })
+                          if (updated) {
+                            setTasks(prev => prev.map(t => t.id === selectedTask.id ? updated : t))
+                            setSelectedTask(updated)
+                          }
+                        }}
+                        className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors ${
+                          selectedTask.type === type
+                            ? type === 'internal' ? 'bg-purple-950 text-purple-400 border border-purple-900' :
+                              'bg-blue-950 text-blue-400 border border-blue-900'
+                            : 'bg-zinc-900 text-zinc-500 border border-zinc-800 hover:border-zinc-700'
+                        }`}
+                      >
+                        {type.charAt(0).toUpperCase() + type.slice(1)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                
+                {selectedTask.client && (
+                  <div>
+                    <label className="text-xs text-zinc-500 block mb-2">Client</label>
+                    <p className="text-sm text-white">{selectedTask.client.name}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+            
+            {/* Attachments Section */}
+            <div className="p-4 border-b border-zinc-800">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-medium text-zinc-300 flex items-center gap-2">
+                  <Paperclip size={14} />
+                  Attachments
+                  <span className="text-xs text-zinc-600">({attachments.length})</span>
+                </h4>
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploadingFile}
+                  className="p-1.5 rounded hover:bg-zinc-800 text-zinc-500 hover:text-white transition-colors disabled:opacity-50"
+                >
+                  {uploadingFile ? <Loader size={14} className="animate-spin" /> : <Upload size={14} />}
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  onChange={handleFileUpload}
+                  className="hidden"
+                />
+              </div>
+              
+              {attachments.length > 0 ? (
+                <div className="space-y-2">
+                  {attachments.map(attachment => (
+                    <div key={attachment.id} className="flex items-center gap-3 p-2 bg-zinc-900 rounded-lg">
+                      <FileText size={16} className="text-zinc-500" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs text-white truncate">{attachment.file_name}</p>
+                        <p className="text-xs text-zinc-500">{formatFileSize(attachment.file_size)}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-xs text-zinc-600 text-center py-2">No attachments</p>
               )}
             </div>
             
-            <div className="space-y-4">
-              <div>
-                <label className="text-xs text-zinc-500 block mb-2">Status</label>
-                <select
-                  value={selectedTask.status_id || ''}
-                  onChange={(e) => handleUpdateTaskStatus(selectedTask.id, e.target.value)}
-                  className="w-full px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white focus:outline-none focus:border-zinc-700"
-                >
-                  {statuses.map(status => (
-                    <option key={status.id} value={status.id}>{status.name}</option>
-                  ))}
-                </select>
-              </div>
+            {/* Comments Section */}
+            <div className="p-4">
+              <h4 className="text-sm font-medium text-zinc-300 flex items-center gap-2 mb-3">
+                <MessageSquare size={14} />
+                Comments
+                <span className="text-xs text-zinc-600">({comments.length})</span>
+              </h4>
               
-              <div>
-                <label className="text-xs text-zinc-500 block mb-2">Priority</label>
-                <div className="flex gap-2">
-                  {(['low', 'medium', 'high'] as const).map(priority => (
-                    <button
-                      key={priority}
-                      onClick={async () => {
-                        const updated = await updateTask(supabase, selectedTask.id, { priority })
-                        if (updated) {
-                          setTasks(prev => prev.map(t => t.id === selectedTask.id ? updated : t))
-                          setSelectedTask(updated)
-                        }
-                      }}
-                      className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors ${
-                        selectedTask.priority === priority
-                          ? priority === 'high' ? 'bg-red-950 text-red-400 border border-red-900' :
-                            priority === 'medium' ? 'bg-yellow-950 text-yellow-400 border border-yellow-900' :
-                            'bg-zinc-800 text-zinc-300 border border-zinc-700'
-                          : 'bg-zinc-900 text-zinc-500 border border-zinc-800 hover:border-zinc-700'
-                      }`}
-                    >
-                      {priority.charAt(0).toUpperCase() + priority.slice(1)}
-                    </button>
-                  ))}
+              {loadingComments ? (
+                <div className="flex items-center justify-center py-4">
+                  <Loader size={16} className="animate-spin text-zinc-500" />
                 </div>
-              </div>
-              
-              <div>
-                <label className="text-xs text-zinc-500 block mb-2">Type</label>
-                <div className="flex gap-2">
-                  {(['client', 'internal'] as const).map(type => (
-                    <button
-                      key={type}
-                      onClick={async () => {
-                        const updated = await updateTask(supabase, selectedTask.id, { type })
-                        if (updated) {
-                          setTasks(prev => prev.map(t => t.id === selectedTask.id ? updated : t))
-                          setSelectedTask(updated)
-                        }
-                      }}
-                      className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors ${
-                        selectedTask.type === type
-                          ? type === 'internal' ? 'bg-purple-950 text-purple-400 border border-purple-900' :
-                            'bg-blue-950 text-blue-400 border border-blue-900'
-                          : 'bg-zinc-900 text-zinc-500 border border-zinc-800 hover:border-zinc-700'
-                      }`}
-                    >
-                      {type.charAt(0).toUpperCase() + type.slice(1)}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              
-              {selectedTask.client && (
-                <div>
-                  <label className="text-xs text-zinc-500 block mb-2">Client</label>
-                  <p className="text-sm text-white">{selectedTask.client.name}</p>
-                </div>
+              ) : (
+                <>
+                  <div className="space-y-3 mb-4 max-h-64 overflow-auto">
+                    {comments.map(comment => (
+                      <div key={comment.id} className={`p-3 rounded-lg ${
+                        comment.is_internal ? 'bg-purple-950/30 border border-purple-900/50' : 'bg-zinc-900'
+                      }`}>
+                        <div className="flex items-center gap-2 mb-1">
+                          <div className="w-5 h-5 rounded-full bg-zinc-700 flex items-center justify-center text-xs font-medium text-white">
+                            {comment.author?.email?.charAt(0).toUpperCase() || '?'}
+                          </div>
+                          <span className="text-xs text-zinc-400">{comment.author?.email || 'Unknown'}</span>
+                          {comment.is_internal && (
+                            <span className="text-xs px-1.5 py-0.5 bg-purple-900/50 text-purple-400 rounded">Internal</span>
+                          )}
+                        </div>
+                        <p className="text-sm text-zinc-300">{comment.content}</p>
+                        <p className="text-xs text-zinc-600 mt-1">
+                          {new Date(comment.created_at).toLocaleDateString()}
+                        </p>
+                      </div>
+                    ))}
+                    {comments.length === 0 && (
+                      <p className="text-xs text-zinc-600 text-center py-2">No comments yet</p>
+                    )}
+                  </div>
+                  
+                  {/* Add Comment */}
+                  <div className="space-y-2">
+                    <textarea
+                      value={newComment}
+                      onChange={(e) => setNewComment(e.target.value)}
+                      placeholder="Add a comment..."
+                      rows={2}
+                      className="w-full px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-700 resize-none"
+                    />
+                    <div className="flex items-center justify-between">
+                      <label className="flex items-center gap-2 text-xs text-zinc-400">
+                        <input
+                          type="checkbox"
+                          checked={isInternalComment}
+                          onChange={(e) => setIsInternalComment(e.target.checked)}
+                          className="rounded bg-zinc-800 border-zinc-700"
+                        />
+                        Internal comment
+                      </label>
+                      <button
+                        onClick={handleAddComment}
+                        disabled={!newComment.trim()}
+                        className="flex items-center gap-1 px-3 py-1.5 bg-teal-500 hover:bg-teal-600 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-lg text-xs font-medium transition-colors"
+                      >
+                        <Send size={12} />
+                        Send
+                      </button>
+                    </div>
+                  </div>
+                </>
               )}
             </div>
           </div>
@@ -631,8 +1040,9 @@ export default function DashboardClient({ user }: DashboardClientProps) {
           <div className="p-4 border-t border-zinc-800">
             <button
               onClick={() => handleDeleteTask(selectedTask.id)}
-              className="w-full px-4 py-2 bg-red-950 hover:bg-red-900 text-red-400 rounded-lg text-sm font-medium transition-colors"
+              className="w-full px-4 py-2 bg-red-950 hover:bg-red-900 text-red-400 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
             >
+              <Trash2 size={14} />
               Delete Task
             </button>
           </div>
