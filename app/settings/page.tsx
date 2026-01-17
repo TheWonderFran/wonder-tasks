@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation'
 import {
   ArrowLeft, User, Bell, Building2, Users, Palette, Globe, CreditCard,
   Zap, Receipt, Plus, GripVertical, Trash2, Circle, Clock, Loader,
-  Eye, HelpCircle, CheckCircle2, Ban, Link2, EyeOff
+  Eye, HelpCircle, CheckCircle2, Ban, Link2, EyeOff, LucideIcon
 } from 'lucide-react'
 
 const defaultStatuses = [
@@ -24,7 +24,11 @@ const mockPlans = [
   { id: 'scale', name: 'Scale', description: 'For agencies', price: 1999, taskLimit: 10, stripeLinked: true },
 ]
 
-const settingsSections = [
+type SettingsSection = 
+  | { id: string; label: string; icon: LucideIcon; type?: undefined }
+  | { id: string; label: string; type: 'divider'; icon?: undefined }
+
+const settingsSections: SettingsSection[] = [
   { id: 'profile', label: 'Profile', icon: User },
   { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'divider1', type: 'divider', label: 'TaskFlow' },
@@ -75,6 +79,7 @@ export default function SettingsPage() {
                 </div>
               )
             }
+            const Icon = section.icon
             return (
               <button
                 key={section.id}
@@ -85,7 +90,7 @@ export default function SettingsPage() {
                     : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
                 }`}
               >
-                {(() => { const Icon = section.icon; return <Icon size={18} />; })()}
+                <Icon size={18} />
                 <span className="text-sm">{section.label}</span>
               </button>
             )
