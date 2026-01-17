@@ -9,12 +9,13 @@ import {
   Eye, EyeOff, MoreHorizontal, CheckCircle2, Circle, Clock,
   AlertCircle, Users, Briefcase, Settings, LayoutGrid, List, Archive,
   ChevronRight, ChevronDown, FolderOpen, Home, FileText, MessageCircle, Loader,
-  HelpCircle, ExternalLink, Ban, LogOut, LucideIcon, Send, Upload, Trash2
+  HelpCircle, ExternalLink, Ban, LogOut, LucideIcon, Send, Upload, Trash2,
+  ArchiveRestore, Edit, Copy, MoreVertical
 } from 'lucide-react'
 import type { Task, Client, Status, Plan, Organization, User as AppUser, Comment, Attachment } from '@/lib/types'
 import {
   getTasks, createTask, updateTask, deleteTask,
-  getClients, createClient as createClientApi,
+  getClients, createClient as createClientApi, updateClient, deleteClient,
   getStatuses, getPlans, getTeamMembers,
   getOrCreateOrganization, createDefaultPlans
 } from '@/lib/supabase/queries'
@@ -32,6 +33,14 @@ const statusIcons: Record<string, LucideIcon> = {
 
 type ViewMode = 'kanban' | 'list'
 type TaskFilter = 'all' | 'client' | 'internal'
+
+interface ContextMenuState {
+  show: boolean
+  x: number
+  y: number
+  type: 'task' | 'client' | null
+  item: Task | Client | null
+}
 
 interface DashboardClientProps {
   user: User
@@ -60,10 +69,31 @@ export default function DashboardClient({ user }: DashboardClientProps) {
   const [showNewClientModal, setShowNewClientModal] = useState(false)
   const [expandedPlans, setExpandedPlans] = useState<Record<string, boolean>>({})
   const [expandedStatuses, setExpandedStatuses] = useState<Record<string, boolean>>({})
+  const [showArchived, setShowArchived] = useState(false)
+  
+  // Context menu state
+  const [contextMenu, setContextMenu] = useState<ContextMenuState>({
+    show: false, x: 0, y: 0, type: null, item: null
+  })
+  
+  // Delete confirmation modal
+  const [deleteModal, setDeleteModal] = useState<{
+    show: boolean
+    type: 'task' | 'client' | null
+    item: Task | Client | null
+  }>({ show: false, type: null, item: null })
+  
+  // Archive confirmation modal
+  const [archiveModal, setArchiveModal] = useState<{
+    show: boolean
+    task: Task | null
+  }>({ show: false, task: null })
   
   // Drag and drop state
   const [draggedTask, setDraggedTask] = useState<Task | null>(null)
   const [dragOverStatus, setDragOverStatus] = useState<string | null>(null)
+  const [draggedClient, setDraggedClient] = useState<Client | null>(null)
+  const [dragOverPlan, setDragOverPlan] = useState<string | null>(null)
   
   // Comments state
   const [comments, setComments] = useState<Comment[]>([])
@@ -86,6 +116,13 @@ export default function DashboardClient({ user }: DashboardClientProps) {
   // New client form state
   const [newClientName, setNewClientName] = useState('')
   const [newClientPlan, setNewClientPlan] = useState<string>('')
+
+  // Close context menu on click outside
+  useEffect(() => {
+    const handleClick = () => setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+    document.addEventListener('click', handleClick)
+    return () => document.removeEventListener('click', handleClick)
+  }, [])
 
   // Load data on mount
   useEffect(() => {
@@ -150,24 +187,28 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       setLoadingComments(true)
       
       // Load comments
-      const { data: commentsData } = await supabase
+      const { data: commentsData, error: commentsError } = await supabase
         .from('comments')
         .select('*, author:users(*)')
         .eq('task_id', selectedTask.id)
         .order('created_at', { ascending: true })
       
-      if (commentsData) {
+      if (commentsError) {
+        console.error('Error loading comments:', commentsError)
+      } else if (commentsData) {
         setComments(commentsData as Comment[])
       }
       
       // Load attachments
-      const { data: attachmentsData } = await supabase
+      const { data: attachmentsData, error: attachmentsError } = await supabase
         .from('attachments')
         .select('*')
         .eq('task_id', selectedTask.id)
         .order('created_at', { ascending: false })
       
-      if (attachmentsData) {
+      if (attachmentsError) {
+        console.error('Error loading attachments:', attachmentsError)
+      } else if (attachmentsData) {
         setAttachments(attachmentsData as Attachment[])
       }
       
@@ -177,9 +218,16 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     loadTaskDetails()
   }, [selectedTask?.id])
 
-  // Filter tasks
+  // Filter tasks (including archive filter)
   const filteredTasks = useMemo(() => {
     return tasks.filter(task => {
+      // Archive filter
+      if (showArchived) {
+        if (!task.is_archived) return false
+      } else {
+        if (task.is_archived) return false
+      }
+      
       if (searchQuery && !task.title.toLowerCase().includes(searchQuery.toLowerCase())) {
         return false
       }
@@ -194,7 +242,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       }
       return true
     })
-  }, [tasks, searchQuery, selectedClient, taskFilter])
+  }, [tasks, searchQuery, selectedClient, taskFilter, showArchived])
 
   // Group tasks by status
   const tasksByStatus = useMemo(() => {
@@ -209,13 +257,11 @@ export default function DashboardClient({ user }: DashboardClientProps) {
   const clientsByPlan = useMemo(() => {
     const grouped: Record<string, Client[]> = {}
     
-    // Initialize with plan IDs
     plans.forEach(plan => {
       grouped[plan.id] = []
     })
     grouped['no-plan'] = []
     
-    // Group clients
     clients.forEach(client => {
       if (client.plan_id && grouped[client.plan_id]) {
         grouped[client.plan_id].push(client)
@@ -227,7 +273,20 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     return grouped
   }, [clients, plans])
 
-  // Drag and drop handlers
+  // Context menu handler
+  const handleContextMenu = (e: React.MouseEvent, type: 'task' | 'client', item: Task | Client) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setContextMenu({
+      show: true,
+      x: e.clientX,
+      y: e.clientY,
+      type,
+      item
+    })
+  }
+
+  // Task drag and drop handlers
   const handleDragStart = (e: React.DragEvent, task: Task) => {
     setDraggedTask(task)
     e.dataTransfer.effectAllowed = 'move'
@@ -260,6 +319,44 @@ export default function DashboardClient({ user }: DashboardClientProps) {
   const handleDragEnd = () => {
     setDraggedTask(null)
     setDragOverStatus(null)
+  }
+
+  // Client drag and drop handlers
+  const handleClientDragStart = (e: React.DragEvent, client: Client) => {
+    setDraggedClient(client)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  const handleClientDragOver = (e: React.DragEvent, planId: string) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    setDragOverPlan(planId)
+  }
+
+  const handleClientDragLeave = () => {
+    setDragOverPlan(null)
+  }
+
+  const handleClientDrop = async (e: React.DragEvent, planId: string) => {
+    e.preventDefault()
+    setDragOverPlan(null)
+    
+    if (draggedClient) {
+      const newPlanId = planId === 'no-plan' ? null : planId
+      if (draggedClient.plan_id !== newPlanId) {
+        const updated = await updateClient(supabase, draggedClient.id, { plan_id: newPlanId })
+        if (updated) {
+          setClients(prev => prev.map(c => c.id === draggedClient.id ? updated : c))
+        }
+      }
+    }
+    
+    setDraggedClient(null)
+  }
+
+  const handleClientDragEnd = () => {
+    setDraggedClient(null)
+    setDragOverPlan(null)
   }
 
   // Task handlers
@@ -304,11 +401,42 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     }
   }
 
+  const handleArchiveTask = async (task: Task) => {
+    const updated = await updateTask(supabase, task.id, { is_archived: true })
+    if (updated) {
+      setTasks(prev => prev.map(t => t.id === task.id ? updated : t))
+      setSelectedTask(null)
+      setArchiveModal({ show: false, task: null })
+    }
+  }
+
+  const handleUnarchiveTask = async (task: Task) => {
+    const updated = await updateTask(supabase, task.id, { is_archived: false })
+    if (updated) {
+      setTasks(prev => prev.map(t => t.id === task.id ? updated : t))
+      if (selectedTask?.id === task.id) {
+        setSelectedTask(updated)
+      }
+    }
+  }
+
   const handleDeleteTask = async (taskId: string) => {
     const success = await deleteTask(supabase, taskId)
     if (success) {
       setTasks(prev => prev.filter(t => t.id !== taskId))
       setSelectedTask(null)
+      setDeleteModal({ show: false, type: null, item: null })
+    }
+  }
+
+  const handleDeleteClient = async (clientId: string) => {
+    const success = await deleteClient(supabase, clientId)
+    if (success) {
+      setClients(prev => prev.filter(c => c.id !== clientId))
+      if (selectedClient === clientId) {
+        setSelectedClient(null)
+      }
+      setDeleteModal({ show: false, type: null, item: null })
     }
   }
 
@@ -327,7 +455,9 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       .select('*, author:users(*)')
       .single()
     
-    if (data && !error) {
+    if (error) {
+      console.error('Error adding comment:', error)
+    } else if (data) {
       setComments(prev => [...prev, data as Comment])
       setNewComment('')
     }
@@ -366,13 +496,45 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       .select()
       .single()
     
-    if (attachment && !dbError) {
+    if (dbError) {
+      console.error('DB error:', dbError)
+    } else if (attachment) {
       setAttachments(prev => [attachment as Attachment, ...prev])
     }
     
     setUploadingFile(false)
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
+    }
+  }
+
+  const handleDownloadAttachment = async (attachment: Attachment) => {
+    const { data } = await supabase.storage
+      .from('attachments')
+      .download(attachment.storage_path)
+    
+    if (data) {
+      const url = URL.createObjectURL(data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = attachment.file_name
+      a.click()
+      URL.revokeObjectURL(url)
+    }
+  }
+
+  const handleDeleteAttachment = async (attachmentId: string) => {
+    const attachment = attachments.find(a => a.id === attachmentId)
+    if (!attachment) return
+    
+    // Delete from storage
+    await supabase.storage.from('attachments').remove([attachment.storage_path])
+    
+    // Delete from database
+    const { error } = await supabase.from('attachments').delete().eq('id', attachmentId)
+    
+    if (!error) {
+      setAttachments(prev => prev.filter(a => a.id !== attachmentId))
     }
   }
 
@@ -430,8 +592,168 @@ export default function DashboardClient({ user }: DashboardClientProps) {
     )
   }
 
+  // Render plan folder with clients
+  const renderPlanFolder = (planId: string, planName: string, planClients: Client[]) => {
+    return (
+      <div 
+        key={planId} 
+        className={`mb-2 rounded-lg transition-colors ${
+          dragOverPlan === planId ? 'bg-teal-950/30 ring-1 ring-teal-500/50' : ''
+        }`}
+        onDragOver={(e) => handleClientDragOver(e, planId)}
+        onDragLeave={handleClientDragLeave}
+        onDrop={(e) => handleClientDrop(e, planId)}
+      >
+        <button
+          onClick={() => togglePlanExpansion(planId)}
+          className="w-full flex items-center gap-2 px-3 py-2 text-zinc-400 hover:text-white transition-colors"
+        >
+          {expandedPlans[planId] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          <FolderOpen size={14} />
+          <span className="text-xs font-medium">{planName}</span>
+          <span className="ml-auto text-xs text-zinc-600">{planClients.length}</span>
+        </button>
+        
+        {expandedPlans[planId] && (
+          <div className="ml-4 space-y-1">
+            {planClients.map(client => (
+              <button
+                key={client.id}
+                draggable
+                onDragStart={(e) => handleClientDragStart(e, client)}
+                onDragEnd={handleClientDragEnd}
+                onClick={() => setSelectedClient(client.id)}
+                onContextMenu={(e) => handleContextMenu(e, 'client', client)}
+                className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-all cursor-grab active:cursor-grabbing ${
+                  selectedClient === client.id ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
+                } ${draggedClient?.id === client.id ? 'opacity-50' : ''}`}
+              >
+                <div className="w-5 h-5 rounded bg-zinc-700 flex items-center justify-center text-xs font-medium text-white">
+                  {client.name.charAt(0)}
+                </div>
+                <span className="text-sm truncate">{client.name}</span>
+                <span className="ml-auto text-xs text-zinc-500">
+                  {tasks.filter(t => t.client_id === client.id && !t.is_archived).length}
+                </span>
+              </button>
+            ))}
+            {planClients.length === 0 && (
+              <p className="text-xs text-zinc-600 px-3 py-2">Drop clients here</p>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div className="min-h-screen bg-zinc-950 flex">
+      {/* Context Menu */}
+      {contextMenu.show && (
+        <div 
+          className="fixed z-50 bg-zinc-900 border border-zinc-800 rounded-lg shadow-xl py-1 min-w-[160px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {contextMenu.type === 'task' && contextMenu.item && (
+            <>
+              <button
+                onClick={() => {
+                  setSelectedTask(contextMenu.item as Task)
+                  setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 transition-colors"
+              >
+                <Eye size={14} />
+                View Details
+              </button>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText((contextMenu.item as Task).title)
+                  setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 transition-colors"
+              >
+                <Copy size={14} />
+                Copy Title
+              </button>
+              <div className="border-t border-zinc-800 my-1" />
+              {(contextMenu.item as Task).is_archived ? (
+                <>
+                  <button
+                    onClick={() => {
+                      handleUnarchiveTask(contextMenu.item as Task)
+                      setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-teal-400 hover:bg-zinc-800 transition-colors"
+                  >
+                    <ArchiveRestore size={14} />
+                    Unarchive
+                  </button>
+                  <button
+                    onClick={() => {
+                      setDeleteModal({ show: true, type: 'task', item: contextMenu.item })
+                      setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-400 hover:bg-zinc-800 transition-colors"
+                  >
+                    <Trash2 size={14} />
+                    Delete Permanently
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => {
+                    setArchiveModal({ show: true, task: contextMenu.item as Task })
+                    setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-yellow-400 hover:bg-zinc-800 transition-colors"
+                >
+                  <Archive size={14} />
+                  Archive
+                </button>
+              )}
+            </>
+          )}
+          
+          {contextMenu.type === 'client' && contextMenu.item && (
+            <>
+              <button
+                onClick={() => {
+                  setSelectedClient((contextMenu.item as Client).id)
+                  setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 transition-colors"
+              >
+                <Eye size={14} />
+                View Tasks
+              </button>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText((contextMenu.item as Client).name)
+                  setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800 transition-colors"
+              >
+                <Copy size={14} />
+                Copy Name
+              </button>
+              <div className="border-t border-zinc-800 my-1" />
+              <button
+                onClick={() => {
+                  setDeleteModal({ show: true, type: 'client', item: contextMenu.item })
+                  setContextMenu({ show: false, x: 0, y: 0, type: null, item: null })
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-400 hover:bg-zinc-800 transition-colors"
+              >
+                <Trash2 size={14} />
+                Delete Client
+              </button>
+            </>
+          )}
+        </div>
+      )}
+      
       {/* Sidebar */}
       <div className="w-64 border-r border-zinc-800 flex flex-col">
         {/* Logo */}
@@ -448,14 +770,25 @@ export default function DashboardClient({ user }: DashboardClientProps) {
         <nav className="flex-1 p-2 overflow-y-auto">
           <div className="space-y-1">
             <button 
-              onClick={() => setSelectedClient(null)}
+              onClick={() => { setSelectedClient(null); setShowArchived(false); }}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all ${
-                !selectedClient ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
+                !selectedClient && !showArchived ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
               }`}
             >
               <Home size={18} />
               <span className="text-sm">All Tasks</span>
-              <span className="ml-auto text-xs text-zinc-500">{tasks.length}</span>
+              <span className="ml-auto text-xs text-zinc-500">{tasks.filter(t => !t.is_archived).length}</span>
+            </button>
+            
+            <button 
+              onClick={() => { setSelectedClient(null); setShowArchived(true); }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all ${
+                showArchived ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
+              }`}
+            >
+              <Archive size={18} />
+              <span className="text-sm">Archived</span>
+              <span className="ml-auto text-xs text-zinc-500">{tasks.filter(t => t.is_archived).length}</span>
             </button>
           </div>
           
@@ -472,83 +805,10 @@ export default function DashboardClient({ user }: DashboardClientProps) {
             </div>
             
             {/* Plans as folders */}
-            {plans.map(plan => {
-              const planClients = clientsByPlan[plan.id] || []
-              if (planClients.length === 0) return null
-              
-              return (
-                <div key={plan.id} className="mb-2">
-                  <button
-                    onClick={() => togglePlanExpansion(plan.id)}
-                    className="w-full flex items-center gap-2 px-3 py-2 text-zinc-400 hover:text-white transition-colors"
-                  >
-                    {expandedPlans[plan.id] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                    <FolderOpen size={14} />
-                    <span className="text-xs font-medium">{plan.name}</span>
-                    <span className="ml-auto text-xs text-zinc-600">{planClients.length}</span>
-                  </button>
-                  
-                  {expandedPlans[plan.id] && (
-                    <div className="ml-4 space-y-1">
-                      {planClients.map(client => (
-                        <button
-                          key={client.id}
-                          onClick={() => setSelectedClient(client.id)}
-                          className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-all ${
-                            selectedClient === client.id ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
-                          }`}
-                        >
-                          <div className="w-5 h-5 rounded bg-zinc-700 flex items-center justify-center text-xs font-medium text-white">
-                            {client.name.charAt(0)}
-                          </div>
-                          <span className="text-sm truncate">{client.name}</span>
-                          <span className="ml-auto text-xs text-zinc-500">
-                            {tasks.filter(t => t.client_id === client.id).length}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )
-            })}
+            {plans.map(plan => renderPlanFolder(plan.id, plan.name, clientsByPlan[plan.id] || []))}
             
             {/* Clients without plan */}
-            {clientsByPlan['no-plan']?.length > 0 && (
-              <div className="mb-2">
-                <button
-                  onClick={() => togglePlanExpansion('no-plan')}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-zinc-400 hover:text-white transition-colors"
-                >
-                  {expandedPlans['no-plan'] ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                  <FolderOpen size={14} />
-                  <span className="text-xs font-medium">No Plan</span>
-                  <span className="ml-auto text-xs text-zinc-600">{clientsByPlan['no-plan'].length}</span>
-                </button>
-                
-                {expandedPlans['no-plan'] && (
-                  <div className="ml-4 space-y-1">
-                    {clientsByPlan['no-plan'].map(client => (
-                      <button
-                        key={client.id}
-                        onClick={() => setSelectedClient(client.id)}
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg transition-all ${
-                          selectedClient === client.id ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
-                        }`}
-                      >
-                        <div className="w-5 h-5 rounded bg-zinc-700 flex items-center justify-center text-xs font-medium text-white">
-                          {client.name.charAt(0)}
-                        </div>
-                        <span className="text-sm truncate">{client.name}</span>
-                        <span className="ml-auto text-xs text-zinc-500">
-                          {tasks.filter(t => t.client_id === client.id).length}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
+            {renderPlanFolder('no-plan', 'No Plan', clientsByPlan['no-plan'] || [])}
             
             {clients.length === 0 && (
               <p className="px-3 py-2 text-xs text-zinc-600">No clients yet</p>
@@ -588,37 +848,41 @@ export default function DashboardClient({ user }: DashboardClientProps) {
         <header className="h-14 border-b border-zinc-800 flex items-center justify-between px-6">
           <div className="flex items-center gap-4">
             <h1 className="text-lg font-semibold text-white">
-              {selectedClient 
-                ? clients.find(c => c.id === selectedClient)?.name || 'Tasks'
-                : 'All Tasks'
+              {showArchived 
+                ? 'Archived Tasks'
+                : selectedClient 
+                  ? clients.find(c => c.id === selectedClient)?.name || 'Tasks'
+                  : 'All Tasks'
               }
             </h1>
-            <div className="flex items-center gap-1 bg-zinc-900 rounded-lg p-1">
-              <button
-                onClick={() => setTaskFilter('all')}
-                className={`px-3 py-1 text-xs rounded-md transition-colors ${
-                  taskFilter === 'all' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                All
-              </button>
-              <button
-                onClick={() => setTaskFilter('client')}
-                className={`px-3 py-1 text-xs rounded-md transition-colors ${
-                  taskFilter === 'client' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                Client
-              </button>
-              <button
-                onClick={() => setTaskFilter('internal')}
-                className={`px-3 py-1 text-xs rounded-md transition-colors ${
-                  taskFilter === 'internal' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                Internal
-              </button>
-            </div>
+            {!showArchived && (
+              <div className="flex items-center gap-1 bg-zinc-900 rounded-lg p-1">
+                <button
+                  onClick={() => setTaskFilter('all')}
+                  className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                    taskFilter === 'all' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  All
+                </button>
+                <button
+                  onClick={() => setTaskFilter('client')}
+                  className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                    taskFilter === 'client' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  Client
+                </button>
+                <button
+                  onClick={() => setTaskFilter('internal')}
+                  className={`px-3 py-1 text-xs rounded-md transition-colors ${
+                    taskFilter === 'internal' ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  Internal
+                </button>
+              </div>
+            )}
           </div>
           
           <div className="flex items-center gap-3">
@@ -652,13 +916,15 @@ export default function DashboardClient({ user }: DashboardClientProps) {
               </button>
             </div>
             
-            <button
-              onClick={() => setShowNewTaskModal(true)}
-              className="flex items-center gap-2 px-4 py-2 bg-teal-500 hover:bg-teal-600 text-white rounded-lg text-sm font-medium transition-colors"
-            >
-              <Plus size={16} />
-              New Task
-            </button>
+            {!showArchived && (
+              <button
+                onClick={() => setShowNewTaskModal(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-teal-500 hover:bg-teal-600 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                <Plus size={16} />
+                New Task
+              </button>
+            )}
           </div>
         </header>
         
@@ -690,13 +956,14 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                     {tasksByStatus[status.id]?.map(task => (
                       <div
                         key={task.id}
-                        draggable
+                        draggable={!showArchived}
                         onDragStart={(e) => handleDragStart(e, task)}
                         onDragEnd={handleDragEnd}
                         onClick={() => setSelectedTask(task)}
+                        onContextMenu={(e) => handleContextMenu(e, 'task', task)}
                         className={`p-4 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-700 cursor-pointer transition-all ${
                           draggedTask?.id === task.id ? 'opacity-50 scale-95' : ''
-                        }`}
+                        } ${task.is_archived ? 'opacity-60' : ''}`}
                       >
                         <div className="flex items-start justify-between mb-2">
                           <h3 className="text-sm font-medium text-white line-clamp-2">{task.title}</h3>
@@ -718,18 +985,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                             )}
                           </div>
                           <div className="flex items-center gap-2">
-                            {(task.comments?.length || 0) > 0 && (
-                              <span className="flex items-center gap-1 text-xs text-zinc-500">
-                                <MessageSquare size={12} />
-                                {task.comments?.length}
-                              </span>
-                            )}
-                            {(task.attachments?.length || 0) > 0 && (
-                              <span className="flex items-center gap-1 text-xs text-zinc-500">
-                                <Paperclip size={12} />
-                                {task.attachments?.length}
-                              </span>
-                            )}
                             <span className={`text-xs px-2 py-0.5 rounded ${
                               task.type === 'internal' ? 'bg-purple-950 text-purple-400' : 'bg-blue-950 text-blue-400'
                             }`}>
@@ -774,9 +1029,10 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                           <div
                             key={task.id}
                             onClick={() => setSelectedTask(task)}
+                            onContextMenu={(e) => handleContextMenu(e, 'task', task)}
                             className={`flex items-center gap-4 px-4 py-3 hover:bg-zinc-900 cursor-pointer transition-colors ${
                               index !== statusTasks.length - 1 ? 'border-b border-zinc-800/50' : ''
-                            }`}
+                            } ${task.is_archived ? 'opacity-60' : ''}`}
                           >
                             <div className="flex-1 min-w-0">
                               <h3 className="text-sm font-medium text-white truncate">{task.title}</h3>
@@ -786,14 +1042,6 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                                 {task.client.name}
                               </span>
                             )}
-                            <div className="flex items-center gap-2">
-                              {(task.comments?.length || 0) > 0 && (
-                                <span className="flex items-center gap-1 text-xs text-zinc-500">
-                                  <MessageSquare size={12} />
-                                  {task.comments?.length}
-                                </span>
-                              )}
-                            </div>
                             <span className={`px-2 py-0.5 text-xs rounded-full ${
                               task.priority === 'high' ? 'bg-red-950 text-red-400' :
                               task.priority === 'medium' ? 'bg-yellow-950 text-yellow-400' :
@@ -811,13 +1059,15 @@ export default function DashboardClient({ user }: DashboardClientProps) {
               
               {filteredTasks.length === 0 && (
                 <div className="text-center py-12">
-                  <p className="text-zinc-500">No tasks found</p>
-                  <button
-                    onClick={() => setShowNewTaskModal(true)}
-                    className="mt-4 text-teal-400 hover:text-teal-300 text-sm"
-                  >
-                    Create your first task
-                  </button>
+                  <p className="text-zinc-500">{showArchived ? 'No archived tasks' : 'No tasks found'}</p>
+                  {!showArchived && (
+                    <button
+                      onClick={() => setShowNewTaskModal(true)}
+                      className="mt-4 text-teal-400 hover:text-teal-300 text-sm"
+                    >
+                      Create your first task
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -829,7 +1079,12 @@ export default function DashboardClient({ user }: DashboardClientProps) {
       {selectedTask && (
         <div className="w-96 border-l border-zinc-800 flex flex-col bg-zinc-950">
           <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
-            <h2 className="font-medium text-white">Task Details</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="font-medium text-white">Task Details</h2>
+              {selectedTask.is_archived && (
+                <span className="text-xs px-2 py-0.5 bg-yellow-950 text-yellow-400 rounded">Archived</span>
+              )}
+            </div>
             <button
               onClick={() => setSelectedTask(null)}
               className="p-1.5 rounded hover:bg-zinc-800 text-zinc-500 hover:text-white transition-colors"
@@ -854,7 +1109,8 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                   <select
                     value={selectedTask.status_id || ''}
                     onChange={(e) => handleUpdateTaskStatus(selectedTask.id, e.target.value)}
-                    className="w-full px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white focus:outline-none focus:border-zinc-700"
+                    disabled={selectedTask.is_archived}
+                    className="w-full px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white focus:outline-none focus:border-zinc-700 disabled:opacity-50"
                   >
                     {statuses.map(status => (
                       <option key={status.id} value={status.id}>{status.name}</option>
@@ -868,6 +1124,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                     {(['low', 'medium', 'high'] as const).map(priority => (
                       <button
                         key={priority}
+                        disabled={selectedTask.is_archived}
                         onClick={async () => {
                           const updated = await updateTask(supabase, selectedTask.id, { priority })
                           if (updated) {
@@ -875,7 +1132,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                             setSelectedTask(updated)
                           }
                         }}
-                        className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors ${
+                        className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors disabled:opacity-50 ${
                           selectedTask.priority === priority
                             ? priority === 'high' ? 'bg-red-950 text-red-400 border border-red-900' :
                               priority === 'medium' ? 'bg-yellow-950 text-yellow-400 border border-yellow-900' :
@@ -895,6 +1152,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                     {(['client', 'internal'] as const).map(type => (
                       <button
                         key={type}
+                        disabled={selectedTask.is_archived}
                         onClick={async () => {
                           const updated = await updateTask(supabase, selectedTask.id, { type })
                           if (updated) {
@@ -902,7 +1160,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                             setSelectedTask(updated)
                           }
                         }}
-                        className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors ${
+                        className={`flex-1 px-3 py-2 text-xs rounded-lg transition-colors disabled:opacity-50 ${
                           selectedTask.type === type
                             ? type === 'internal' ? 'bg-purple-950 text-purple-400 border border-purple-900' :
                               'bg-blue-950 text-blue-400 border border-blue-900'
@@ -932,13 +1190,15 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                   Attachments
                   <span className="text-xs text-zinc-600">({attachments.length})</span>
                 </h4>
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={uploadingFile}
-                  className="p-1.5 rounded hover:bg-zinc-800 text-zinc-500 hover:text-white transition-colors disabled:opacity-50"
-                >
-                  {uploadingFile ? <Loader size={14} className="animate-spin" /> : <Upload size={14} />}
-                </button>
+                {!selectedTask.is_archived && (
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploadingFile}
+                    className="p-1.5 rounded hover:bg-zinc-800 text-zinc-500 hover:text-white transition-colors disabled:opacity-50"
+                  >
+                    {uploadingFile ? <Loader size={14} className="animate-spin" /> : <Upload size={14} />}
+                  </button>
+                )}
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -950,12 +1210,23 @@ export default function DashboardClient({ user }: DashboardClientProps) {
               {attachments.length > 0 ? (
                 <div className="space-y-2">
                   {attachments.map(attachment => (
-                    <div key={attachment.id} className="flex items-center gap-3 p-2 bg-zinc-900 rounded-lg">
+                    <div key={attachment.id} className="flex items-center gap-3 p-2 bg-zinc-900 rounded-lg group">
                       <FileText size={16} className="text-zinc-500" />
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs text-white truncate">{attachment.file_name}</p>
+                        <p 
+                          className="text-xs text-white truncate cursor-pointer hover:text-teal-400"
+                          onClick={() => handleDownloadAttachment(attachment)}
+                        >
+                          {attachment.file_name}
+                        </p>
                         <p className="text-xs text-zinc-500">{formatFileSize(attachment.file_size)}</p>
                       </div>
+                      <button
+                        onClick={() => handleDeleteAttachment(attachment.id)}
+                        className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
+                      >
+                        <Trash2 size={12} />
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -994,7 +1265,7 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                         </div>
                         <p className="text-sm text-zinc-300">{comment.content}</p>
                         <p className="text-xs text-zinc-600 mt-1">
-                          {new Date(comment.created_at).toLocaleDateString()}
+                          {new Date(comment.created_at).toLocaleDateString()} at {new Date(comment.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                         </p>
                       </div>
                     ))}
@@ -1004,47 +1275,153 @@ export default function DashboardClient({ user }: DashboardClientProps) {
                   </div>
                   
                   {/* Add Comment */}
-                  <div className="space-y-2">
-                    <textarea
-                      value={newComment}
-                      onChange={(e) => setNewComment(e.target.value)}
-                      placeholder="Add a comment..."
-                      rows={2}
-                      className="w-full px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-700 resize-none"
-                    />
-                    <div className="flex items-center justify-between">
-                      <label className="flex items-center gap-2 text-xs text-zinc-400">
-                        <input
-                          type="checkbox"
-                          checked={isInternalComment}
-                          onChange={(e) => setIsInternalComment(e.target.checked)}
-                          className="rounded bg-zinc-800 border-zinc-700"
-                        />
-                        Internal comment
-                      </label>
-                      <button
-                        onClick={handleAddComment}
-                        disabled={!newComment.trim()}
-                        className="flex items-center gap-1 px-3 py-1.5 bg-teal-500 hover:bg-teal-600 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-lg text-xs font-medium transition-colors"
-                      >
-                        <Send size={12} />
-                        Send
-                      </button>
+                  {!selectedTask.is_archived && (
+                    <div className="space-y-2">
+                      <textarea
+                        value={newComment}
+                        onChange={(e) => setNewComment(e.target.value)}
+                        placeholder="Add a comment..."
+                        rows={2}
+                        className="w-full px-3 py-2 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-700 resize-none"
+                      />
+                      <div className="flex items-center justify-between">
+                        <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={isInternalComment}
+                            onChange={(e) => setIsInternalComment(e.target.checked)}
+                            className="rounded bg-zinc-800 border-zinc-700 text-teal-500 focus:ring-teal-500"
+                          />
+                          Internal comment
+                        </label>
+                        <button
+                          onClick={handleAddComment}
+                          disabled={!newComment.trim()}
+                          className="flex items-center gap-1 px-3 py-1.5 bg-teal-500 hover:bg-teal-600 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-lg text-xs font-medium transition-colors"
+                        >
+                          <Send size={12} />
+                          Send
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  )}
                 </>
               )}
             </div>
           </div>
           
           <div className="p-4 border-t border-zinc-800">
-            <button
-              onClick={() => handleDeleteTask(selectedTask.id)}
-              className="w-full px-4 py-2 bg-red-950 hover:bg-red-900 text-red-400 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
-            >
-              <Trash2 size={14} />
-              Delete Task
-            </button>
+            {selectedTask.is_archived ? (
+              <div className="flex gap-2">
+                <button
+                  onClick={() => handleUnarchiveTask(selectedTask)}
+                  className="flex-1 px-4 py-2 bg-teal-950 hover:bg-teal-900 text-teal-400 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                >
+                  <ArchiveRestore size={14} />
+                  Unarchive
+                </button>
+                <button
+                  onClick={() => setDeleteModal({ show: true, type: 'task', item: selectedTask })}
+                  className="flex-1 px-4 py-2 bg-red-950 hover:bg-red-900 text-red-400 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+                >
+                  <Trash2 size={14} />
+                  Delete
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setArchiveModal({ show: true, task: selectedTask })}
+                className="w-full px-4 py-2 bg-yellow-950 hover:bg-yellow-900 text-yellow-400 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2"
+              >
+                <Archive size={14} />
+                Archive Task
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      
+      {/* Archive Confirmation Modal */}
+      {archiveModal.show && archiveModal.task && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 bg-yellow-950 rounded-full flex items-center justify-center">
+                <Archive size={20} className="text-yellow-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-white">Archive Task</h2>
+                <p className="text-sm text-zinc-400">This task will be moved to the archive.</p>
+              </div>
+            </div>
+            
+            <p className="text-sm text-zinc-300 mb-6">
+              Are you sure you want to archive "<span className="text-white font-medium">{archiveModal.task.title}</span>"? 
+              You can restore it later from the Archived section.
+            </p>
+            
+            <div className="flex gap-3">
+              <button
+                onClick={() => setArchiveModal({ show: false, task: null })}
+                className="flex-1 px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleArchiveTask(archiveModal.task!)}
+                className="flex-1 px-4 py-2.5 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                Archive
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Delete Confirmation Modal */}
+      {deleteModal.show && deleteModal.item && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 bg-red-950 rounded-full flex items-center justify-center">
+                <Trash2 size={20} className="text-red-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-white">Delete {deleteModal.type === 'task' ? 'Task' : 'Client'}</h2>
+                <p className="text-sm text-zinc-400">This action cannot be undone.</p>
+              </div>
+            </div>
+            
+            <p className="text-sm text-zinc-300 mb-6">
+              Are you sure you want to permanently delete "
+              <span className="text-white font-medium">
+                {deleteModal.type === 'task' 
+                  ? (deleteModal.item as Task).title 
+                  : (deleteModal.item as Client).name}
+              </span>"? 
+              {deleteModal.type === 'client' && ' All associated tasks will also be affected.'}
+            </p>
+            
+            <div className="flex gap-3">
+              <button
+                onClick={() => setDeleteModal({ show: false, type: null, item: null })}
+                className="flex-1 px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                Go Back
+              </button>
+              <button
+                onClick={() => {
+                  if (deleteModal.type === 'task') {
+                    handleDeleteTask((deleteModal.item as Task).id)
+                  } else {
+                    handleDeleteClient((deleteModal.item as Client).id)
+                  }
+                }}
+                className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                Delete
+              </button>
+            </div>
           </div>
         </div>
       )}
