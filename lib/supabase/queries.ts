@@ -18,7 +18,11 @@ export async function getOrCreateOrganization(
     .single()
 
   if (existingUser?.organization_id && existingUser.organizations) {
-    return existingUser.organizations as Organization
+    // Handle both array and object responses from Supabase
+    const org = Array.isArray(existingUser.organizations) 
+      ? existingUser.organizations[0] 
+      : existingUser.organizations
+    return org as Organization
   }
 
   // Create new organization for new users
