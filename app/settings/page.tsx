@@ -85,7 +85,7 @@ export default function SettingsPage() {
                     : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
                 }`}
               >
-                <section.icon size={18} />
+                {(() => { const Icon = section.icon; return <Icon size={18} />; })()}
                 <span className="text-sm">{section.label}</span>
               </button>
             )
